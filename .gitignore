@@ -1,0 +1,15 @@
+/.gradle/
+/build/
+/.idea/
+*.iml
+/.env*
+*.log
+*.class
+*.jar
+*.zip
+*.tar.gz
+*.key
+*.pem
+*.pfx
+*.p12
+sync-profile.json

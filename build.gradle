@@ -1,0 +1,77 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.runeledger'
+version = '0.1.0'
+
+repositories {
+    maven {
+        url = 'https://repo.runelite.net'
+        content { includeGroupByRegex('net\\.runelite.*') }
+    }
+    mavenCentral()
+}
+
+def runeLiteVersion = providers.gradleProperty('runeLiteVersion').orElse('latest.release').get()
+def runeLiteCache = providers.gradleProperty('runeLiteCache').orNull
+
+dependencies {
+    if (runeLiteCache == null) {
+        compileOnly "net.runelite:client:${runeLiteVersion}"
+        testImplementation "net.runelite:client:${runeLiteVersion}"
+    } else {
+        // The launcher already downloads these JARs. Select one matching client and API.
+        if (runeLiteVersion == 'latest.release') {
+            throw new GradleException('Specify -PruneLiteVersion for an offline cache build.')
+        }
+        def apiJar = "runelite-api-${runeLiteVersion}.jar"
+        def compileApi = file("${runeLiteCache}/${apiJar}")
+        if (!compileApi.isFile()) {
+            compileApi = file(".gradle/runeledger-api/${apiJar}")
+        }
+        if (!compileApi.isFile()) {
+            throw new GradleException("The full ${apiJar} is needed for game constants. See README.md for the offline setup.")
+        }
+        def cached = fileTree(runeLiteCache) {
+            include '*.jar'
+            exclude { entry ->
+                def name = entry.file.name
+                (name.startsWith('client-') && name != "client-${runeLiteVersion}.jar") ||
+                    (name.startsWith('runelite-api-') && name != "runelite-api-${runeLiteVersion}-runtime.jar") ||
+                    (name.startsWith('injected-client-') && name != "injected-client-${runeLiteVersion}.jar")
+            }
+        }
+        compileOnly files(compileApi)
+        testCompileOnly files(compileApi)
+        compileOnly cached
+        testImplementation cached
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release.set(11)
+}
+
+tasks.register('run', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    if (runeLiteCache != null) {
+        def authHelper = layout.buildDirectory.file('dependencies/jagexauth-0.3.jar').get().asFile
+        if (authHelper.isFile()) {
+            classpath += files(authHelper)
+        }
+    }
+    mainClass = 'com.runeledger.sync.SyncLauncher'
+    jvmArgs '-ea'
+    args '--developer-mode'
+}
+
+tasks.register('transportTest', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.runeledger.sync.SnapshotTransportTest'
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('transportTest')
+}

@@ -16,7 +16,7 @@ The app must use its default Windows data folder for discovery. The beta reads t
 
 1. Open **Player lookup → RuneLite sync** on [Rune Ledger](https://rune-ledger.vercel.app/) or on your self-hosted site. Enter your OSRS display name and select **Generate pairing token**. Returning users can sign in to an existing Rune Ledger account first.
 2. In RuneLite’s **Rune Ledger Sync** settings, leave **Local app** off and enter the site’s HTTPS root URL and the same display name. Enable **Enable account sync**. Log in to the matching character, paste the pairing token into the **Rune Ledger Sync** sidebar, and select **Use code**.
-3. Enable **Include bank contents** or **Include Slayer task** if you want those features. Open your regular bank to send a bank snapshot. Load the snapshot from the site’s RuneLite sync panel.
+3. Enable **Include bank contents**, **Include Slayer task**, or **Include quest completion** for the features you want. Open your regular bank to send a bank snapshot. Load the snapshot from the site’s RuneLite sync panel.
 
 ## Sync code storage
 
@@ -26,7 +26,9 @@ Replace any pairing tokens previously entered through RuneLite's plugin settings
 
 ## Data sent
 
-Network sync defaults to off and runs only for the matching logged-in character. The configured server receives the display name, real skill levels, and exact XP and can see your IP address. It uses the Rune Ledger pairing token to authenticate uploads. Bank sync separately sends item IDs and quantities from the regular bank after you open it. Slayer sync separately sends the current assignment, remaining count, starting count when available, and assigned area. Both optional settings default to off.
+Network sync defaults to off and runs only for the matching logged-in character. The configured server receives the display name, real skill levels, and exact XP and can see your IP address. It uses the Rune Ledger pairing token to authenticate uploads. Bank sync separately sends item IDs and quantities from the regular bank after you open it. Slayer sync separately sends the current assignment, remaining count, starting count when available, and assigned area. Quest sync separately sends the completed quest and miniquest IDs alongside the number of entries RuneLite checked. All three optional settings default to off.
+
+If you pause and delete quest data in Rune Ledger, disable **Include quest completion** in RuneLite to stop sending it. To send a fresh observation after you resume quest data in Rune Ledger, turn **Include quest completion** off and back on.
 
 ## AI development disclosure
 
@@ -41,7 +43,7 @@ gradle -PruneLiteVersion=1.13.8 build
 gradle -PruneLiteVersion=1.13.8 run
 ```
 
-`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.1-beta.2.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
+`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.1-beta.3.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
 
 Hosted uploads use JDK HTTPS with certificate and hostname verification. The numeric loopback connection uses RuneLite's HTTP library with the desktop HMAC check. RuneLite still supplies its own runtime libraries, so updates to those libraries follow the client release.
 

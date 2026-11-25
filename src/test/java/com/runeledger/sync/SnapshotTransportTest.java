@@ -39,6 +39,8 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.TrustManagerFactory;
 import net.runelite.api.Client;
+import net.runelite.api.Quest;
+import net.runelite.api.QuestState;
 import okhttp3.Call;
 import okhttp3.Response;
 
@@ -65,6 +67,7 @@ public final class SnapshotTransportTest
         check(SnapshotTransport.validToken(token), "allow an instance token");
         checkWindowsCredentialStore(token);
         JsonElement task = checkSlayerCapture();
+        JsonObject quests = checkQuestCapture();
 
         Gson gson = new GsonBuilder().serializeNulls().create();
         checkLocalApp(gson, token);
@@ -151,6 +154,7 @@ public final class SnapshotTransportTest
             check(("Bearer " + token).equals(auth.get()), "write uses the scoped token");
             check(!payload.get().has("bank"), "unobserved bank is omitted");
             check(!payload.get().has("slayer"), "unobserved Slayer task is omitted");
+            check(!payload.get().has("quests"), "unobserved quest completion is omitted");
             check(payload.get().get("schemaVersion").getAsInt() == 1, "versioned payload");
             check(payload.get().getAsJsonArray("skills").get(0).getAsJsonObject().get("xp").getAsInt() == 101333, "exact XP");
             SnapshotTransport.Snapshot empty = new SnapshotTransport.Snapshot("Test Iron", skills, List.of(), JsonNull.INSTANCE);
@@ -161,6 +165,10 @@ public final class SnapshotTransportTest
             check(transport.newHostedCall(hosted, snapshotEndpoint, token, assignment).execute() == 200, "upload Slayer update");
             check(payload.get().get("slayer").equals(task), "include Slayer task with both nullable fields");
             check(!payload.get().has("bank"), "Slayer update does not claim to observe the bank");
+            SnapshotTransport.Snapshot questProgress = new SnapshotTransport.Snapshot("Test Iron", skills, null, null, quests);
+            check(transport.newHostedCall(hosted, snapshotEndpoint, token, questProgress).execute() == 200, "upload quest completion");
+            check(payload.get().get("quests").equals(quests), "include a complete quest observation");
+            check(!payload.get().has("bank") && !payload.get().has("slayer"), "quest update does not claim to observe other data");
             check(transport.newHostedCall(hosted, origin.resolve("/redirect"), token, empty).execute() == 307, "never follow redirects");
             SnapshotTransport.HostedUpload slowCall = transport.newHostedCall(hosted, origin.resolve("/slow-response"), token, empty);
             int slowStatus = testSender.submit(slowCall::execute).get(4, TimeUnit.SECONDS);
@@ -449,6 +457,35 @@ public final class SnapshotTransportTest
         {
             return response.code();
         }
+    }
+
+    private static JsonObject checkQuestCapture()
+    {
+        check(!new RuneLedgerConfig() {}.syncQuests(), "quest sync starts disabled");
+        QuestProgressReader reader = new QuestProgressReader();
+        AtomicInteger checked = new AtomicInteger();
+        int total = (int) Arrays.stream(Quest.values()).map(Quest::getId).distinct().count();
+        JsonObject result = null;
+        for (int expected = 0; expected < total;)
+        {
+            expected = Math.min(expected + 10, total);
+            result = reader.readBatch(quest ->
+            {
+                checked.incrementAndGet();
+                if (quest == Quest.ANIMAL_MAGNETISM || quest == Quest.ZOGRE_FLESH_EATERS)
+                {
+                    return QuestState.FINISHED;
+                }
+                return quest == Quest.BLACK_KNIGHTS_FORTRESS ? QuestState.IN_PROGRESS : QuestState.NOT_STARTED;
+            });
+            check(checked.get() == expected, "read a bounded batch each tick");
+            check((result != null) == (expected == total), "wait to publish until all quests are checked");
+        }
+        check(result != null && result.get("total").getAsInt() == total, "report all checked quests");
+        var completed = result.getAsJsonArray("completed");
+        check(completed.size() == 2 && completed.get(0).getAsInt() == Quest.ANIMAL_MAGNETISM.getId()
+            && completed.get(1).getAsInt() == Quest.ZOGRE_FLESH_EATERS.getId(), "include only completed quest IDs");
+        return result;
     }
 
     private static JsonElement checkSlayerCapture()

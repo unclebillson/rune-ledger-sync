@@ -50,14 +50,15 @@ import org.slf4j.LoggerFactory;
 
 @PluginDescriptor(
     name = "Rune Ledger Sync",
-    description = "Sync skills and optionally your opened bank and Slayer task to your own Rune Ledger",
-    tags = {"skills", "bank", "slayer", "sync"}
+    description = "Sync skills and optionally your opened bank, Slayer task and completed quests to your own Rune Ledger",
+    tags = {"skills", "bank", "slayer", "quests", "sync"}
 )
 public class RuneLedgerPlugin extends Plugin
 {
     private static final Logger LOG = LoggerFactory.getLogger(RuneLedgerPlugin.class);
     private static final long UPLOAD_INTERVAL = TimeUnit.SECONDS.toNanos(15);
     private static final long RETRY_INTERVAL = TimeUnit.SECONDS.toNanos(60);
+    private static final long QUEST_SCAN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final long LOCAL_DISCOVERY_INTERVAL = TimeUnit.SECONDS.toNanos(5);
     private static final Pattern PLAYER_NAME = Pattern.compile("[A-Za-z0-9 -]{1,12}");
     private static final EnumSet<WorldType> SEPARATE_PROFILES = EnumSet.of(
@@ -209,22 +210,27 @@ public class RuneLedgerPlugin extends Plugin
         }
         boolean bankEnabled = config.syncBank();
         boolean slayerEnabled = config.syncSlayer();
+        boolean questsEnabled = config.syncQuests();
         Session active = session;
-        if (active == null || !active.matches(scope, localTarget, token, bankEnabled, slayerEnabled))
+        if (active == null || !active.matches(scope, localTarget, token, bankEnabled, slayerEnabled, questsEnabled))
         {
             resetSession();
-            active = new Session(scope, localTarget, token, bankEnabled, slayerEnabled);
+            active = new Session(scope, localTarget, token, bankEnabled, slayerEnabled, questsEnabled);
             session = active;
         }
         if (bankEnabled)
         {
             captureOpenBank(active);
         }
-        if (slayerEnabled && !active.slayerReady)
+        if ((slayerEnabled || questsEnabled) && !active.gameVariablesReady)
         {
             // Let the profile's game variables settle before reporting a fresh session.
-            active.slayerReady = true;
+            active.gameVariablesReady = true;
             return;
+        }
+        if (questsEnabled)
+        {
+            sampleQuests(active);
         }
         sampleAndSend(worker, active);
     }
@@ -397,7 +403,8 @@ public class RuneLedgerPlugin extends Plugin
         String fingerprint = worker.transport.fingerprint(skills);
         Map<Integer, Integer> bank = Objects.equals(active.observedBank, active.uploadedBank) ? null : active.observedBank;
         JsonElement slayer = sampleSlayer(active);
-        if (fingerprint.equals(active.uploadedSkills) && bank == null && slayer == null)
+        JsonElement quests = Objects.equals(active.observedQuests, active.uploadedQuests) ? null : active.observedQuests;
+        if (fingerprint.equals(active.uploadedSkills) && bank == null && slayer == null && quests == null)
         {
             active.nextUpload = now + UPLOAD_INTERVAL;
             return;
@@ -415,7 +422,7 @@ public class RuneLedgerPlugin extends Plugin
         {
             return;
         }
-        SnapshotTransport.Snapshot snapshot = new SnapshotTransport.Snapshot(active.scope.player, skills, bankStacks, slayer);
+        SnapshotTransport.Snapshot snapshot = new SnapshotTransport.Snapshot(active.scope.player, skills, bankStacks, slayer, quests);
         try
         {
             worker.executor.execute(() -> upload(worker, active, snapshot, fingerprint, bank));
@@ -424,6 +431,35 @@ public class RuneLedgerPlugin extends Plugin
         {
             worker.sending.set(false);
         }
+    }
+
+    private void sampleQuests(Session active)
+    {
+        long now = System.nanoTime();
+        if (active.questReader == null)
+        {
+            if (active.nextQuestScan != 0 && now - active.nextQuestScan < 0)
+            {
+                return;
+            }
+            active.questReader = new QuestProgressReader();
+        }
+
+        try
+        {
+            JsonElement quests = active.questReader.readBatch(quest -> quest.getState(client));
+            if (quests == null)
+            {
+                return;
+            }
+            active.observedQuests = quests;
+        }
+        catch (RuntimeException exception)
+        {
+            LOG.debug("Could not read quest completion.", exception);
+        }
+        active.questReader = null;
+        active.nextQuestScan = now + QUEST_SCAN_INTERVAL;
     }
 
     private void upload(UploadWorker worker, Session active, SnapshotTransport.Snapshot snapshot, String fingerprint, Map<Integer, Integer> bank)
@@ -478,6 +514,10 @@ public class RuneLedgerPlugin extends Plugin
                 if (snapshot.slayer != null)
                 {
                     active.uploadedSlayer = snapshot.slayer;
+                }
+                if (snapshot.quests != null)
+                {
+                    active.uploadedQuests = snapshot.quests;
                 }
                 active.nextUpload = System.nanoTime() + UPLOAD_INTERVAL;
             }
@@ -663,27 +703,36 @@ public class RuneLedgerPlugin extends Plugin
         final String token;
         final boolean bankEnabled;
         final boolean slayerEnabled;
-        boolean slayerReady;
+        final boolean questsEnabled;
+        boolean gameVariablesReady;
         boolean bankNeedsCapture = true;
         Map<Integer, Integer> observedBank;
         volatile Map<Integer, Integer> uploadedBank;
         volatile String uploadedSkills;
         volatile JsonElement uploadedSlayer;
+        QuestProgressReader questReader;
+        JsonElement observedQuests;
+        volatile JsonElement uploadedQuests;
+        long nextQuestScan;
         volatile long nextUpload;
 
-        Session(CredentialScope scope, LocalAppTarget localTarget, String token, boolean bankEnabled, boolean slayerEnabled)
+        Session(CredentialScope scope, LocalAppTarget localTarget, String token, boolean bankEnabled, boolean slayerEnabled,
+            boolean questsEnabled)
         {
             this.scope = scope;
             this.localTarget = localTarget;
             this.token = token;
             this.bankEnabled = bankEnabled;
             this.slayerEnabled = slayerEnabled;
+            this.questsEnabled = questsEnabled;
         }
 
-        boolean matches(CredentialScope selected, LocalAppTarget local, String credential, boolean includeBank, boolean includeSlayer)
+        boolean matches(CredentialScope selected, LocalAppTarget local, String credential, boolean includeBank,
+            boolean includeSlayer, boolean includeQuests)
         {
             return scope.equals(selected) && token.equals(credential)
-                && Objects.equals(localTarget, local) && bankEnabled == includeBank && slayerEnabled == includeSlayer;
+                && Objects.equals(localTarget, local) && bankEnabled == includeBank && slayerEnabled == includeSlayer
+                && questsEnabled == includeQuests;
         }
     }
 }

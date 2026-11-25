@@ -13,7 +13,7 @@ public interface RuneLedgerConfig extends Config
     @ConfigSection(
         name = "Hosted Rune Ledger",
         description = "Connection settings for a hosted Rune Ledger site. Local app mode uses only the local sync code.",
-        position = 5,
+        position = 6,
         closedByDefault = true
     )
     String HOSTED = "hosted";
@@ -23,7 +23,7 @@ public interface RuneLedgerConfig extends Config
         name = "Enable account sync",
         description = "Sends your display name, skill levels, and XP to your selected Rune Ledger destination.",
         warning = "This feature submits your IP address, RuneScape display name, skill levels, and XP to the configured "
-            + "Rune Ledger server, which is not controlled or verified by RuneLite developers. Bank and Slayer data are optional.",
+            + "Rune Ledger server, which is not controlled or verified by RuneLite developers. Bank, Slayer and quest data are optional.",
         position = 0
     )
     default boolean syncEnabled()
@@ -86,6 +86,18 @@ public interface RuneLedgerConfig extends Config
         position = 4
     )
     default boolean syncSlayer()
+    {
+        return false;
+    }
+
+    @ConfigItem(
+        keyName = "syncQuests",
+        name = "Include quest completion",
+        description = "Sends completed quest and miniquest IDs for bank advice.",
+        warning = "This option sends your completed quest and miniquest IDs to your selected Rune Ledger destination.",
+        position = 5
+    )
+    default boolean syncQuests()
     {
         return false;
     }

@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.runeledger'
-version = '0.1.1-beta.2'
+version = '0.1.1-beta.3'
 
 repositories {
     maven {

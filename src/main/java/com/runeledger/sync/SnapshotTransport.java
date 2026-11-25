@@ -195,6 +195,10 @@ final class SnapshotTransport
         {
             payload.add("slayer", snapshot.slayer);
         }
+        if (snapshot.quests != null)
+        {
+            payload.add("quests", snapshot.quests);
+        }
         return payload.toString();
     }
 
@@ -283,13 +287,20 @@ final class SnapshotTransport
         final List<SkillValue> skills;
         final List<BankStack> bank;
         final transient JsonElement slayer;
+        final transient JsonElement quests;
 
         Snapshot(String player, List<SkillValue> skills, List<BankStack> bank, JsonElement slayer)
+        {
+            this(player, skills, bank, slayer, null);
+        }
+
+        Snapshot(String player, List<SkillValue> skills, List<BankStack> bank, JsonElement slayer, JsonElement quests)
         {
             this.player = player;
             this.skills = skills;
             this.bank = bank;
             this.slayer = slayer;
+            this.quests = quests;
         }
     }
 

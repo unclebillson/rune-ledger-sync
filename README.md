@@ -2,6 +2,16 @@
 
 Rune Ledger Sync sends your own OSRS character data from RuneLite to a hosted or self-hosted Rune Ledger site. Rune Ledger uses those snapshots for skill planning, bank advice, and Slayer tracking.
 
+## Pair the Windows app beta
+
+This branch is for local testing. Use it with Rune Ledger for Windows `0.1.2-beta.1` or a compatible later desktop build.
+
+1. In the Windows app, use **Player lookup → RuneLite sync** to generate or copy the sync code for your character. Turn on **RuneLite → Enable local sync** from the app menu.
+2. In the beta plugin, turn on **Local app**, paste the code into **Sync code**, and turn on **Enable account sync**. Log in to the matching character. The plugin takes the display name from RuneLite and finds the app on the same Windows account.
+3. To track multiple characters, save each code in that character's RuneLite profile. Keep the Windows app open while syncing. **Hosted Rune Ledger** settings apply when **Local app** is off. [RuneLite Profiles](https://github.com/runelite/runelite/wiki/General-Features#profiles)
+
+The app must use its default Windows data folder for discovery. The beta reads the current local listener address from a per-user descriptor and checks the listener's identity before submitting the code to `127.0.0.1`. The app publishes the descriptor only while local sync is enabled.
+
 ## Pair RuneLite
 
 1. Open **Player lookup → RuneLite sync** on [Rune Ledger](https://rune-ledger.vercel.app/) or on your self-hosted site. Enter your OSRS display name and select **Generate pairing token**. Returning users can sign in to an existing Rune Ledger account first.
@@ -25,7 +35,7 @@ gradle -PruneLiteVersion=1.13.8 build
 gradle -PruneLiteVersion=1.13.8 run
 ```
 
-`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.0.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
+`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.1-beta.1.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
 
 For an offline build using JARs from a previously run RuneLite version, pass the launcher’s local dependency cache. The runtime API in that cache omits the named game constants. Download the full [RuneLite 1.13.8 compile-time API](https://repo.runelite.net/net/runelite/runelite-api/1.13.8/runelite-api-1.13.8.jar) once and place it at `.gradle/runeledger-api/runelite-api-1.13.8.jar` inside this plugin directory. Then run:
 

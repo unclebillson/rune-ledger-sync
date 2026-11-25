@@ -50,6 +50,7 @@ public class RuneLedgerPlugin extends Plugin
     private static final Logger LOG = LoggerFactory.getLogger(RuneLedgerPlugin.class);
     private static final long UPLOAD_INTERVAL = TimeUnit.SECONDS.toNanos(15);
     private static final long RETRY_INTERVAL = TimeUnit.SECONDS.toNanos(60);
+    private static final long LOCAL_DISCOVERY_INTERVAL = TimeUnit.SECONDS.toNanos(5);
     private static final EnumSet<WorldType> SEPARATE_PROFILES = EnumSet.of(
         WorldType.SEASONAL, WorldType.DEADMAN, WorldType.TOURNAMENT_WORLD, WorldType.BETA_WORLD,
         WorldType.NOSAVE_MODE, WorldType.QUEST_SPEEDRUNNING, WorldType.FRESH_START_WORLD, WorldType.PVP_ARENA
@@ -79,7 +80,7 @@ public class RuneLedgerPlugin extends Plugin
     @Override
     protected void startUp()
     {
-        sender = new UploadWorker(new SnapshotTransport(httpClient, gson));
+        sender = new UploadWorker(new SnapshotTransport(httpClient, gson), SnapshotTransport.forLocalApp(gson));
     }
 
     @Override
@@ -142,11 +143,18 @@ public class RuneLedgerPlugin extends Plugin
         }
 
         String name = SnapshotTransport.normalizeName(client.getLocalPlayer().getName());
-        String pairedPlayer = SnapshotTransport.normalizeName(config.playerName());
-        String configuredToken = config.token();
+        boolean localApp = config.localApp();
+        String configuredToken = localApp ? config.localSyncCode() : config.token();
         String token = configuredToken == null ? "" : configuredToken.trim();
-        URI endpoint = SnapshotTransport.endpoint(config.serverUrl());
-        if (name.isEmpty() || !name.equalsIgnoreCase(pairedPlayer) || endpoint == null || !SnapshotTransport.validToken(token))
+        if (name.isEmpty() || !SnapshotTransport.validToken(token)
+            || (!localApp && !name.equalsIgnoreCase(SnapshotTransport.normalizeName(config.playerName()))))
+        {
+            resetSession();
+            return;
+        }
+        LocalAppTarget localTarget = localApp ? worker.discoverLocalApp() : null;
+        URI endpoint = localApp ? (localTarget == null ? null : localTarget.endpoint) : SnapshotTransport.endpoint(config.serverUrl());
+        if (endpoint == null)
         {
             resetSession();
             return;
@@ -154,10 +162,10 @@ public class RuneLedgerPlugin extends Plugin
         boolean bankEnabled = config.syncBank();
         boolean slayerEnabled = config.syncSlayer();
         Session active = session;
-        if (active == null || !active.matches(name, endpoint, token, bankEnabled, slayerEnabled))
+        if (active == null || !active.matches(name, endpoint, localTarget, token, bankEnabled, slayerEnabled))
         {
             resetSession();
-            active = new Session(name, endpoint, token, bankEnabled, slayerEnabled);
+            active = new Session(name, endpoint, localTarget, token, bankEnabled, slayerEnabled);
             session = active;
         }
         if (bankEnabled)
@@ -297,7 +305,20 @@ public class RuneLedgerPlugin extends Plugin
             {
                 return;
             }
-            Call call = worker.transport.newCall(active.endpoint, active.token, snapshot);
+            Call call;
+            if (active.localTarget == null)
+            {
+                call = worker.transport.newCall(active.endpoint, active.token, snapshot);
+            }
+            else
+            {
+                SnapshotTransport.LocalProbe probe = new SnapshotTransport.LocalProbe(active.localTarget);
+                if (!verifyLocalApp(worker, active, probe))
+                {
+                    return;
+                }
+                call = worker.localTransport.newLocalCall(probe, active.token, snapshot);
+            }
             worker.activeCall = call;
             if (sender != worker || session != active)
             {
@@ -337,7 +358,9 @@ public class RuneLedgerPlugin extends Plugin
             if (sender == worker && session == active)
             {
                 active.nextUpload = System.nanoTime() + RETRY_INTERVAL;
-                LOG.warn("Rune Ledger could not be reached. Check the configured server URL.");
+                LOG.warn(active.localTarget == null
+                    ? "Rune Ledger could not be reached. Check the configured server URL."
+                    : "Rune Ledger Desktop could not be reached. Check that local sync is enabled in the app.");
             }
         }
         finally
@@ -347,11 +370,34 @@ public class RuneLedgerPlugin extends Plugin
         }
     }
 
+    private boolean verifyLocalApp(UploadWorker worker, Session active, SnapshotTransport.LocalProbe probe) throws IOException
+    {
+        Call call = worker.localTransport.probeLocalApp(probe);
+        worker.activeCall = call;
+        if (sender != worker || session != active)
+        {
+            return false;
+        }
+        try (Response response = call.execute())
+        {
+            if (probe.verify(response))
+            {
+                return true;
+            }
+        }
+        active.nextUpload = System.nanoTime() + RETRY_INTERVAL;
+        LOG.warn("Rune Ledger Desktop identity could not be verified. Check that local sync is enabled in the app.");
+        return false;
+    }
+
     private static final class UploadWorker
     {
         final SnapshotTransport transport;
+        final SnapshotTransport localTransport;
         final AtomicBoolean sending = new AtomicBoolean();
         volatile Call activeCall;
+        private volatile LocalAppTarget localTarget;
+        private long nextDiscovery;
         final ExecutorService executor = Executors.newSingleThreadExecutor(task ->
         {
             Thread thread = new Thread(task, "rune-ledger-sync");
@@ -359,9 +405,38 @@ public class RuneLedgerPlugin extends Plugin
             return thread;
         });
 
-        UploadWorker(SnapshotTransport transport)
+        UploadWorker(SnapshotTransport transport, SnapshotTransport localTransport)
         {
             this.transport = transport;
+            this.localTransport = localTransport;
+        }
+
+        LocalAppTarget discoverLocalApp()
+        {
+            long now = System.nanoTime();
+            if ((nextDiscovery == 0 || now - nextDiscovery >= 0) && sending.compareAndSet(false, true))
+            {
+                nextDiscovery = now + LOCAL_DISCOVERY_INTERVAL;
+                try
+                {
+                    executor.execute(() ->
+                    {
+                        try
+                        {
+                            localTarget = LocalAppTarget.find();
+                        }
+                        finally
+                        {
+                            sending.set(false);
+                        }
+                    });
+                }
+                catch (RejectedExecutionException ignored)
+                {
+                    sending.set(false);
+                }
+            }
+            return localTarget;
         }
 
         void cancelActiveCall()
@@ -378,6 +453,7 @@ public class RuneLedgerPlugin extends Plugin
     {
         final String player;
         final URI endpoint;
+        final LocalAppTarget localTarget;
         final String token;
         final boolean bankEnabled;
         final boolean slayerEnabled;
@@ -389,19 +465,20 @@ public class RuneLedgerPlugin extends Plugin
         volatile JsonElement uploadedSlayer;
         volatile long nextUpload;
 
-        Session(String player, URI endpoint, String token, boolean bankEnabled, boolean slayerEnabled)
+        Session(String player, URI endpoint, LocalAppTarget localTarget, String token, boolean bankEnabled, boolean slayerEnabled)
         {
             this.player = player;
             this.endpoint = endpoint;
+            this.localTarget = localTarget;
             this.token = token;
             this.bankEnabled = bankEnabled;
             this.slayerEnabled = slayerEnabled;
         }
 
-        boolean matches(String name, URI target, String credential, boolean includeBank, boolean includeSlayer)
+        boolean matches(String name, URI target, LocalAppTarget local, String credential, boolean includeBank, boolean includeSlayer)
         {
             return player.equalsIgnoreCase(name) && endpoint.equals(target) && token.equals(credential)
-                && bankEnabled == includeBank && slayerEnabled == includeSlayer;
+                && Objects.equals(localTarget, local) && bankEnabled == includeBank && slayerEnabled == includeSlayer;
         }
     }
 }

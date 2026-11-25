@@ -8,9 +8,13 @@ import com.google.gson.JsonObject;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.lang.reflect.Proxy;
+import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.GeneralSecurityException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -18,7 +22,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import net.runelite.api.Client;
 import okhttp3.Call;
 import okhttp3.OkHttpClient;
@@ -44,6 +52,7 @@ public final class SnapshotTransportTest
         JsonElement task = checkSlayerCapture();
 
         Gson gson = new GsonBuilder().serializeNulls().create();
+        checkLocalApp(gson, token);
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         AtomicReference<JsonObject> payload = new AtomicReference<>();
         AtomicReference<String> auth = new AtomicReference<>();
@@ -149,6 +158,149 @@ public final class SnapshotTransportTest
             releasePendingResponse.countDown();
             testSender.shutdownNow();
             server.stop(0);
+        }
+    }
+
+    private static void checkLocalApp(Gson gson, String token) throws IOException
+    {
+        String proofKey = "b".repeat(32);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        Path descriptor = Files.createTempFile("rune-ledger-local", ".json");
+        AtomicBoolean replay = new AtomicBoolean();
+        AtomicBoolean closeProbe = new AtomicBoolean();
+        AtomicBoolean probeHasSecrets = new AtomicBoolean();
+        AtomicBoolean postHasProof = new AtomicBoolean();
+        AtomicInteger posts = new AtomicInteger();
+        AtomicReference<String> postAuth = new AtomicReference<>();
+        AtomicReference<String> lastChallenge = new AtomicReference<>();
+        AtomicReference<String> lastProof = new AtomicReference<>();
+        server.createContext("/api/sync/snapshot", request ->
+        {
+            try
+            {
+                if ("HEAD".equals(request.getRequestMethod()))
+                {
+                    String challenge = request.getRequestHeaders().getFirst(LocalAppTarget.CHALLENGE_HEADER);
+                    probeHasSecrets.set(request.getRequestHeaders().containsKey("Authorization")
+                        || request.getRequestHeaders().containsKey(LocalAppTarget.PROOF_HEADER)
+                        || request.getRequestHeaders().values().stream().flatMap(List::stream).anyMatch(proofKey::equals));
+                    check(challenge != null && challenge.matches("[a-f0-9]{32}"), "send a fresh lowercase hexadecimal challenge");
+                    lastChallenge.set(challenge);
+                    String proof = replay.get() ? lastProof.get() : desktopProof(proofKey, challenge);
+                    if (!replay.get())
+                    {
+                        lastProof.set(proof);
+                    }
+                    request.getResponseHeaders().set(LocalAppTarget.PROOF_HEADER, proof);
+                    if (closeProbe.get())
+                    {
+                        request.getResponseHeaders().set("Connection", "close");
+                    }
+                    request.sendResponseHeaders(204, -1);
+                }
+                else
+                {
+                    posts.incrementAndGet();
+                    postAuth.set(request.getRequestHeaders().getFirst("Authorization"));
+                    postHasProof.set(request.getRequestHeaders().containsKey(LocalAppTarget.CHALLENGE_HEADER)
+                        || request.getRequestHeaders().containsKey(LocalAppTarget.PROOF_HEADER)
+                        || request.getRequestHeaders().values().stream().flatMap(List::stream).anyMatch(proofKey::equals));
+                    request.getRequestBody().readAllBytes();
+                    request.sendResponseHeaders(200, -1);
+                }
+            }
+            finally
+            {
+                request.close();
+            }
+        });
+        server.start();
+        try
+        {
+            int port = server.getAddress().getPort();
+            String valid = "{\"port\":" + port + ",\"proofKey\":\"" + proofKey + "\"}";
+            for (String invalid : List.of(
+                "", "[]", valid + "{}", valid + " ".repeat(256),
+                valid.replace("\"port\":", "\"url\":"),
+                valid.replace("\"port\":", "\"port\":1234,\"port\":"),
+                valid.replace(String.valueOf(port), "\"1234\""),
+                valid.replace(String.valueOf(port), "1.0"),
+                valid.replace(String.valueOf(port), "65536"),
+                valid.replace("\"proofKey\":", "\"instance\":"),
+                valid.replace(proofKey, proofKey.toUpperCase(java.util.Locale.ROOT))))
+            {
+                Files.writeString(descriptor, invalid);
+                check(LocalAppTarget.read(descriptor) == null, "reject invalid local descriptor");
+            }
+            Files.writeString(descriptor, valid);
+            LocalAppTarget target = LocalAppTarget.read(descriptor);
+            check(target != null && target.endpoint.getHost().equals("127.0.0.1") && target.endpoint.getPort() == port,
+                "derive a fixed loopback endpoint from the descriptor");
+            SnapshotTransport local = SnapshotTransport.forLocalApp(gson);
+            SnapshotTransport.Snapshot snapshot = new SnapshotTransport.Snapshot("Test Iron",
+                List.of(new SnapshotTransport.SkillValue("Smithing", 50, 101333)), null, null);
+
+            SnapshotTransport.LocalProbe probe = new SnapshotTransport.LocalProbe(target);
+            try (Response response = local.probeLocalApp(probe).execute())
+            {
+                check(probe.verify(response), "verify the expected desktop listener");
+            }
+            check(!probeHasSecrets.get(), "the local probe sends only a public challenge");
+            check(status(local.newLocalCall(probe, token, snapshot)) == 200, "upload over the verified connection");
+            check(("Bearer " + token).equals(postAuth.get()), "authenticate desktop uploads");
+            check(!postHasProof.get(), "keep discovery proof material out of the desktop upload");
+
+            String usedChallenge = lastChallenge.get();
+            replay.set(true);
+            SnapshotTransport.LocalProbe mismatch = new SnapshotTransport.LocalProbe(target);
+            try (Response response = local.probeLocalApp(mismatch).execute())
+            {
+                check(!mismatch.verify(response), "reject a listener that replays a valid proof from a different challenge");
+            }
+            check(!usedChallenge.equals(lastChallenge.get()), "generate a different challenge for each probe");
+            checkBlocked(local.newLocalCall(mismatch, token, snapshot));
+
+            replay.set(false);
+            closeProbe.set(true);
+            SnapshotTransport.LocalProbe closed = new SnapshotTransport.LocalProbe(target);
+            try (Response response = local.probeLocalApp(closed).execute())
+            {
+                check(closed.verify(response), "recognize the expected listener before it disconnects");
+            }
+            checkBlocked(local.newLocalCall(closed, token, snapshot));
+            check(posts.get() == 1, "refuse to write over unverified or replacement connections");
+        }
+        finally
+        {
+            Files.deleteIfExists(descriptor);
+            server.stop(0);
+        }
+    }
+
+    private static String desktopProof(String key, String challenge)
+    {
+        try
+        {
+            Mac hmac = Mac.getInstance("HmacSHA256");
+            hmac.init(new SecretKeySpec(key.getBytes(StandardCharsets.US_ASCII), "HmacSHA256"));
+            return String.format("%064x", new BigInteger(1, hmac.doFinal(challenge.getBytes(StandardCharsets.US_ASCII))));
+        }
+        catch (GeneralSecurityException exception)
+        {
+            throw new AssertionError("HMAC-SHA256 unavailable.", exception);
+        }
+    }
+
+    private static void checkBlocked(Call call)
+    {
+        try
+        {
+            status(call);
+            throw new AssertionError("An unverified local upload was sent.");
+        }
+        catch (IOException expected)
+        {
+            check(expected.getMessage().equals("The verified local app connection closed."), "cancel before writing the upload");
         }
     }
 

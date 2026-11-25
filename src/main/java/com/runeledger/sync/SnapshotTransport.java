@@ -3,16 +3,20 @@ package com.runeledger.sync;
 import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import java.io.IOException;
+import java.net.Proxy;
 import java.net.URI;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import okhttp3.Call;
+import okhttp3.Connection;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
+import okhttp3.Response;
 
 final class SnapshotTransport
 {
@@ -32,6 +36,34 @@ final class SnapshotTransport
             .retryOnConnectionFailure(false)
             .build();
         this.gson = gson;
+    }
+
+    static SnapshotTransport forLocalApp(Gson gson)
+    {
+        OkHttpClient direct = new OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .addNetworkInterceptor(chain ->
+            {
+                Request request = chain.request();
+                LocalProbe probe = request.tag(LocalProbe.class);
+                if (probe == null || chain.connection() == null)
+                {
+                    throw new IOException("Missing local app verification.");
+                }
+                if ("HEAD".equals(request.method()))
+                {
+                    probe.connection = chain.connection();
+                    probe.verified = false;
+                }
+                else if (!probe.verified || probe.connection != chain.connection())
+                {
+                    // A different process could have rebound this port since the probe.
+                    throw new IOException("The verified local app connection closed.");
+                }
+                return chain.proceed(request);
+            })
+            .build();
+        return new SnapshotTransport(direct, gson);
     }
 
     static URI endpoint(String value)
@@ -82,6 +114,26 @@ final class SnapshotTransport
 
     Call newCall(URI endpoint, String token, Snapshot snapshot)
     {
+        return newCall(endpoint, token, snapshot, null);
+    }
+
+    Call probeLocalApp(LocalProbe probe)
+    {
+        return client.newCall(new Request.Builder()
+            .url(probe.target.endpoint.toString())
+            .header(LocalAppTarget.CHALLENGE_HEADER, probe.challenge)
+            .tag(LocalProbe.class, probe)
+            .head()
+            .build());
+    }
+
+    Call newLocalCall(LocalProbe probe, String token, Snapshot snapshot)
+    {
+        return newCall(probe.target.endpoint, token, snapshot, probe);
+    }
+
+    private Call newCall(URI endpoint, String token, Snapshot snapshot, LocalProbe probe)
+    {
         JsonObject payload = gson.toJsonTree(snapshot).getAsJsonObject();
         if (snapshot.bank == null)
         {
@@ -91,12 +143,35 @@ final class SnapshotTransport
         {
             payload.add("slayer", snapshot.slayer);
         }
-        Request request = new Request.Builder()
+        Request.Builder request = new Request.Builder()
             .url(endpoint.toString())
             .header("Authorization", "Bearer " + token)
-            .post(RequestBody.create(JSON, payload.toString()))
-            .build();
-        return client.newCall(request);
+            .post(RequestBody.create(JSON, payload.toString()));
+        if (probe != null)
+        {
+            request.tag(LocalProbe.class, probe);
+        }
+        return client.newCall(request.build());
+    }
+
+    static final class LocalProbe
+    {
+        final LocalAppTarget target;
+        private final String challenge = LocalAppTarget.newChallenge();
+        private Connection connection;
+        private boolean verified;
+
+        LocalProbe(LocalAppTarget target)
+        {
+            this.target = target;
+        }
+
+        boolean verify(Response response)
+        {
+            List<String> proofs = response.headers(LocalAppTarget.PROOF_HEADER);
+            verified = response.code() == 204 && proofs.size() == 1 && target.verifiesProof(challenge, proofs.get(0));
+            return verified;
+        }
     }
 
     static final class Snapshot

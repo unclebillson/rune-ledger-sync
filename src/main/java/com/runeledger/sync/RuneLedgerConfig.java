@@ -43,18 +43,6 @@ public interface RuneLedgerConfig extends Config
     }
 
     @ConfigItem(
-        keyName = "localSyncCode",
-        name = "Sync code",
-        description = "Paste the Windows app's sync code for the character you log into.",
-        secret = true,
-        position = 2
-    )
-    default String localSyncCode()
-    {
-        return "";
-    }
-
-    @ConfigItem(
         keyName = "serverUrl",
         name = "Rune Ledger URL",
         description = "The root URL of your Rune Ledger site. Use HTTPS for remote servers.",
@@ -63,7 +51,7 @@ public interface RuneLedgerConfig extends Config
     )
     default String serverUrl()
     {
-        return "http://127.0.0.1:3000";
+        return "https://rune-ledger.vercel.app";
     }
 
     @ConfigItem(
@@ -74,19 +62,6 @@ public interface RuneLedgerConfig extends Config
         section = HOSTED
     )
     default String playerName()
-    {
-        return "";
-    }
-
-    @ConfigItem(
-        keyName = "token",
-        name = "Pairing token",
-        description = "The scoped sync token from your Rune Ledger instance.",
-        secret = true,
-        position = 2,
-        section = HOSTED
-    )
-    default String token()
     {
         return "";
     }

@@ -4,12 +4,25 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.Proxy;
+import java.net.ProxySelector;
 import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.security.GeneralSecurityException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 import okhttp3.Call;
 import okhttp3.Connection;
 import okhttp3.MediaType;
@@ -26,7 +39,7 @@ final class SnapshotTransport
     private final OkHttpClient client;
     private final Gson gson;
 
-    SnapshotTransport(OkHttpClient client, Gson gson)
+    private SnapshotTransport(OkHttpClient client, Gson gson)
     {
         this.client = client.newBuilder()
             .connectTimeout(5, TimeUnit.SECONDS)
@@ -36,6 +49,34 @@ final class SnapshotTransport
             .retryOnConnectionFailure(false)
             .build();
         this.gson = gson;
+    }
+
+    static HttpClient hostedClient()
+    {
+        // Use the JDK TLS stack and its default trust store independently of RuneLite's HTTP settings.
+        try
+        {
+            SSLContext context = SSLContext.getInstance("TLS");
+            context.init(null, null, null);
+            return hostedClient(context);
+        }
+        catch (GeneralSecurityException exception)
+        {
+            throw new IllegalStateException("Rune Ledger could not initialize HTTPS.", exception);
+        }
+    }
+
+    static HttpClient hostedClient(SSLContext context)
+    {
+        SSLParameters parameters = new SSLParameters();
+        parameters.setEndpointIdentificationAlgorithm("HTTPS");
+        return HttpClient.newBuilder()
+            .sslContext(context)
+            .sslParameters(parameters)
+            .proxy(ProxySelector.of(null))
+            .connectTimeout(Duration.ofSeconds(5))
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .build();
     }
 
     static SnapshotTransport forLocalApp(Gson gson)
@@ -76,22 +117,17 @@ final class SnapshotTransport
         {
             URI base = URI.create(value.trim());
             String host = base.getHost();
-            if (host == null || base.getRawUserInfo() != null || base.getRawQuery() != null
+            if (!"https".equalsIgnoreCase(base.getScheme()) || host == null
+                || base.getRawUserInfo() != null || base.getRawQuery() != null
                 || base.getRawFragment() != null || (!base.getPath().isEmpty() && !base.getPath().equals("/"))
                 || base.getPort() == 0 || base.getPort() > 65535)
             {
                 return null;
             }
-            host = host.toLowerCase(Locale.ROOT);
-            boolean loopback = host.equals("127.0.0.1") || host.equals("localhost") || host.equals("[::1]");
-            if (!"https".equalsIgnoreCase(base.getScheme())
-                && !("http".equalsIgnoreCase(base.getScheme()) && loopback))
-            {
-                return null;
-            }
-            return base.resolve("/api/sync/snapshot");
+            int port = base.getPort() == 443 ? -1 : base.getPort();
+            return new URI("https", null, host.toLowerCase(Locale.ROOT), port, "/api/sync/snapshot", null, null);
         }
-        catch (IllegalArgumentException ex)
+        catch (IllegalArgumentException | URISyntaxException ex)
         {
             return null;
         }
@@ -112,9 +148,19 @@ final class SnapshotTransport
         return name == null ? "" : NAME_SPACES.matcher(name).replaceAll(" ").trim();
     }
 
-    Call newCall(URI endpoint, String token, Snapshot snapshot)
+    HostedUpload newHostedCall(HttpClient hosted, URI endpoint, String token, Snapshot snapshot)
     {
-        return newCall(endpoint, token, snapshot, null);
+        if (!"https".equals(endpoint.getScheme()))
+        {
+            throw new IllegalArgumentException("Rune Ledger hosted uploads require HTTPS.");
+        }
+        HttpRequest request = HttpRequest.newBuilder(endpoint)
+            .timeout(Duration.ofSeconds(8))
+            .header("Authorization", "Bearer " + token)
+            .header("Content-Type", JSON.toString())
+            .POST(HttpRequest.BodyPublishers.ofString(payload(snapshot)))
+            .build();
+        return new HostedUpload(hosted, request);
     }
 
     Call probeLocalApp(LocalProbe probe)
@@ -129,10 +175,16 @@ final class SnapshotTransport
 
     Call newLocalCall(LocalProbe probe, String token, Snapshot snapshot)
     {
-        return newCall(probe.target.endpoint, token, snapshot, probe);
+        Request request = new Request.Builder()
+            .url(probe.target.endpoint.toString())
+            .header("Authorization", "Bearer " + token)
+            .post(RequestBody.create(JSON, payload(snapshot)))
+            .tag(LocalProbe.class, probe)
+            .build();
+        return client.newCall(request);
     }
 
-    private Call newCall(URI endpoint, String token, Snapshot snapshot, LocalProbe probe)
+    private String payload(Snapshot snapshot)
     {
         JsonObject payload = gson.toJsonTree(snapshot).getAsJsonObject();
         if (snapshot.bank == null)
@@ -143,15 +195,65 @@ final class SnapshotTransport
         {
             payload.add("slayer", snapshot.slayer);
         }
-        Request.Builder request = new Request.Builder()
-            .url(endpoint.toString())
-            .header("Authorization", "Bearer " + token)
-            .post(RequestBody.create(JSON, payload.toString()));
-        if (probe != null)
+        return payload.toString();
+    }
+
+    static final class HostedUpload
+    {
+        private final HttpClient client;
+        private final HttpRequest request;
+        private boolean cancelled;
+        private CompletableFuture<HttpResponse<InputStream>> pending;
+
+        HostedUpload(HttpClient client, HttpRequest request)
         {
-            request.tag(LocalProbe.class, probe);
+            this.client = client;
+            this.request = request;
         }
-        return client.newCall(request.build());
+
+        int execute() throws IOException
+        {
+            synchronized (this)
+            {
+                if (cancelled)
+                {
+                    throw new IOException("Rune Ledger upload was cancelled.");
+                }
+                pending = client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+            }
+            try
+            {
+                HttpResponse<InputStream> response = pending.get(8, TimeUnit.SECONDS);
+                try (InputStream ignored = response.body())
+                {
+                    return response.statusCode();
+                }
+            }
+            catch (InterruptedException ex)
+            {
+                cancel();
+                Thread.currentThread().interrupt();
+                throw new IOException("Rune Ledger upload was interrupted.", ex);
+            }
+            catch (java.util.concurrent.TimeoutException ex)
+            {
+                cancel();
+                throw new IOException("Rune Ledger upload timed out.", ex);
+            }
+            catch (ExecutionException | CancellationException ex)
+            {
+                throw new IOException("Rune Ledger upload failed.", ex);
+            }
+        }
+
+        synchronized void cancel()
+        {
+            cancelled = true;
+            if (pending != null)
+            {
+                pending.cancel(true);
+            }
+        }
     }
 
     static final class LocalProbe

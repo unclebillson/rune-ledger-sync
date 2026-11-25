@@ -7,16 +7,22 @@ Rune Ledger Sync sends your own OSRS character data from RuneLite to a hosted or
 This branch is for local testing. Use it with Rune Ledger for Windows `0.1.2-beta.1` or a compatible later desktop build.
 
 1. In the Windows app, use **Player lookup → RuneLite sync** to generate or copy the sync code for your character. Turn on **RuneLite → Enable local sync** from the app menu.
-2. In the beta plugin, turn on **Local app**, paste the code into **Sync code**, and turn on **Enable account sync**. Log in to the matching character. The plugin takes the display name from RuneLite and finds the app on the same Windows account.
-3. To track multiple characters, save each code in that character's RuneLite profile. Keep the Windows app open while syncing. **Hosted Rune Ledger** settings apply when **Local app** is off. [RuneLite Profiles](https://github.com/runelite/runelite/wiki/General-Features#profiles)
+2. In the beta plugin's settings, turn on **Local app** and **Enable account sync**. Log in to the matching character. Open the **Rune Ledger Sync** sidebar, paste the code and select **Use code**. The panel shows the character and destination.
+3. To track multiple characters, repeat this for each logged-in character. Keep the Windows app open while syncing. **Hosted Rune Ledger** settings apply when **Local app** is off.
 
 The app must use its default Windows data folder for discovery. The beta reads the current local listener address from a per-user descriptor and checks the listener's identity before submitting the code to `127.0.0.1`. The app publishes the descriptor only while local sync is enabled.
 
 ## Pair RuneLite
 
 1. Open **Player lookup → RuneLite sync** on [Rune Ledger](https://rune-ledger.vercel.app/) or on your self-hosted site. Enter your OSRS display name and select **Generate pairing token**. Returning users can sign in to an existing Rune Ledger account first.
-2. In RuneLite’s **Rune Ledger Sync** settings, enter the site’s root URL and the same display name. Paste the pairing token and enable **Enable account sync**. Use HTTPS for remote sites.
+2. In RuneLite’s **Rune Ledger Sync** settings, leave **Local app** off and enter the site’s HTTPS root URL and the same display name. Enable **Enable account sync**. Log in to the matching character, paste the pairing token into the **Rune Ledger Sync** sidebar, and select **Use code**.
 3. Enable **Include bank contents** or **Include Slayer task** if you want those features. Open your regular bank to send a bank snapshot. Load the snapshot from the site’s RuneLite sync panel.
+
+## Sync code storage
+
+The sidebar keeps codes separate from RuneLite configuration and cloud profiles. On Windows, it saves codes in user-scoped DPAPI-encrypted files, one per character and destination. Session-only use is available when Windows protection is unavailable or on another operating system. **Clear code** removes the code for the character and destination shown in the sidebar.
+
+Replace any pairing tokens previously entered through RuneLite's plugin settings, then enter the new codes through the sidebar. Rotation invalidates copies that may remain in older profile exports or debug logs.
 
 ## Data sent
 
@@ -28,14 +34,16 @@ Rune Ledger Sync was built with OpenAI Codex, which generated plugin code, tests
 
 ## Build and launch
 
-With JDK 11 or 17 and Gradle 7.5.1 or newer, open a terminal in this directory.
+With JDK 17 and Gradle 7.5.1, open a terminal in this directory. The beta defaults to RuneLite 1.13.8.
 
 ```powershell
 gradle -PruneLiteVersion=1.13.8 build
 gradle -PruneLiteVersion=1.13.8 run
 ```
 
-`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.1-beta.1.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
+`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.1-beta.2.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
+
+Hosted uploads use JDK HTTPS with certificate and hostname verification. The numeric loopback connection uses RuneLite's HTTP library with the desktop HMAC check. RuneLite still supplies its own runtime libraries, so updates to those libraries follow the client release.
 
 For an offline build using JARs from a previously run RuneLite version, pass the launcher’s local dependency cache. The runtime API in that cache omits the named game constants. Download the full [RuneLite 1.13.8 compile-time API](https://repo.runelite.net/net/runelite/runelite-api/1.13.8/runelite-api-1.13.8.jar) once and place it at `.gradle/runeledger-api/runelite-api-1.13.8.jar` inside this plugin directory. Then run:
 
@@ -63,7 +71,7 @@ If an offline cache launch logs `jagexauth not found`, the cached dependencies l
 
 ## Test without logging into OSRS
 
-Run the `transportTest` task using the same Gradle and cache options as `build`. It sends synthetic snapshots to a temporary loopback HTTP server and checks authentication, exact XP, bank payloads, Slayer task states, redirect handling, and cancellation. It reads synthetic Slayer game variables and cache rows without starting the RuneLite client.
+Run the `transportTest` task using the same Gradle and cache options as `build`. It checks desktop HMAC verification and connection binding, hosted TLS validation, authentication, payloads, redirect handling, and cancellation with synthetic loopback servers. On Windows, it also verifies that codes survive encrypted save and replace, stay separate by character and destination, and can be removed. It reads synthetic Slayer game variables and cache rows without starting RuneLite.
 
 An in-game check also verified skills, bank contents, and an active Slayer task against the hosted site on RuneLite 1.13.8.
 

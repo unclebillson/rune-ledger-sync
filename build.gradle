@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.runeledger'
-version = '0.1.1-beta.1'
+version = '0.1.1-beta.2'
 
 repositories {
     maven {
@@ -13,7 +13,7 @@ repositories {
     mavenCentral()
 }
 
-def runeLiteVersion = providers.gradleProperty('runeLiteVersion').orElse('latest.release').get()
+def runeLiteVersion = providers.gradleProperty('runeLiteVersion').orElse('1.13.8').get()
 def runeLiteCache = providers.gradleProperty('runeLiteCache').orNull
 
 dependencies {

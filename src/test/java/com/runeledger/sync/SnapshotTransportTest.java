@@ -5,16 +5,23 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
+import com.sun.jna.Platform;
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsServer;
 import java.io.IOException;
+import java.io.InputStream;
 import java.lang.reflect.Proxy;
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.URI;
+import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,9 +34,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.TrustManagerFactory;
 import net.runelite.api.Client;
 import okhttp3.Call;
-import okhttp3.OkHttpClient;
 import okhttp3.Response;
 
 public final class SnapshotTransportTest
@@ -42,18 +52,25 @@ public final class SnapshotTransportTest
         check(SnapshotTransport.endpoint("https://user@example.org") == null, "reject URL credentials");
         check(SnapshotTransport.endpoint("https://example.org/?name=example") == null, "reject query");
         check(SnapshotTransport.endpoint("https://example.org").getPath().equals("/api/sync/snapshot"), "allow HTTPS");
-        check(SnapshotTransport.endpoint("http://[::1]:3000") != null, "allow IPv6 loopback");
+        check(SnapshotTransport.endpoint("http://[::1]:3000") == null, "reject unverified IPv6 loopback");
+        check(SnapshotTransport.endpoint("http://127.0.0.1:3000") == null, "reject unverified IPv4 loopback");
+        check(SnapshotTransport.endpoint("http://localhost:3000") == null, "reject unverified localhost");
+        check(SnapshotTransport.endpoint("https://EXAMPLE.ORG:443/").equals(SnapshotTransport.endpoint("https://example.org")),
+            "normalize hosted destinations before choosing a code");
         check(SnapshotTransport.normalizeName(" Test_Iron ").equals("Test Iron"), "normalize display name");
         check(SnapshotTransport.normalizeName(" Test_\u00a0 Iron ").equals("Test Iron"), "collapse multiple display-name separators");
         check(!SnapshotTransport.validToken("short"), "reject weak token");
         check(!SnapshotTransport.validToken(null), "reject an unset token");
         String token = "a".repeat(64);
         check(SnapshotTransport.validToken(token), "allow an instance token");
+        checkWindowsCredentialStore(token);
         JsonElement task = checkSlayerCapture();
 
         Gson gson = new GsonBuilder().serializeNulls().create();
         checkLocalApp(gson, token);
-        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        SSLContext[] contexts = testTlsContexts();
+        HttpsServer server = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.setHttpsConfigurator(new HttpsConfigurator(contexts[0]));
         AtomicReference<JsonObject> payload = new AtomicReference<>();
         AtomicReference<String> auth = new AtomicReference<>();
         CountDownLatch releaseResponse = new CountDownLatch(1);
@@ -111,45 +128,61 @@ public final class SnapshotTransportTest
         ExecutorService testSender = Executors.newSingleThreadExecutor();
         try
         {
-            URI origin = URI.create("http://127.0.0.1:" + server.getAddress().getPort());
-            SnapshotTransport transport = new SnapshotTransport(new OkHttpClient(), gson);
+            URI origin = URI.create("https://127.0.0.1:" + server.getAddress().getPort());
+            URI snapshotEndpoint = origin.resolve("/api/sync/snapshot");
+            SnapshotTransport transport = SnapshotTransport.forLocalApp(gson);
+            HttpClient hosted = SnapshotTransport.hostedClient(contexts[1]);
             List<SnapshotTransport.SkillValue> skills = List.of(new SnapshotTransport.SkillValue("Smithing", 50, 101333));
             SnapshotTransport.Snapshot unobserved = new SnapshotTransport.Snapshot("Test Iron", skills, null, null);
-            check(status(transport.newCall(origin.resolve("/api/sync/snapshot"), token, unobserved)) == 200, "upload skills");
+            try
+            {
+                transport.newHostedCall(hosted, URI.create("http://127.0.0.1/api/sync/snapshot"), token, unobserved);
+                throw new AssertionError("reject HTTP even when passed directly to the hosted transport");
+            }
+            catch (IllegalArgumentException expected)
+            {
+                // No hosted request is created for a cleartext URI.
+            }
+            rejectsCertificate(transport.newHostedCall(SnapshotTransport.hostedClient(), snapshotEndpoint, token, unobserved));
+            URI wrongName = URI.create("https://localhost:" + server.getAddress().getPort() + "/api/sync/snapshot");
+            rejectsCertificate(transport.newHostedCall(hosted, wrongName, token, unobserved));
+            check(payload.get() == null, "rejected HTTPS peers received no snapshot");
+            check(transport.newHostedCall(hosted, snapshotEndpoint, token, unobserved).execute() == 200, "upload skills");
             check(("Bearer " + token).equals(auth.get()), "write uses the scoped token");
             check(!payload.get().has("bank"), "unobserved bank is omitted");
             check(!payload.get().has("slayer"), "unobserved Slayer task is omitted");
             check(payload.get().get("schemaVersion").getAsInt() == 1, "versioned payload");
             check(payload.get().getAsJsonArray("skills").get(0).getAsJsonObject().get("xp").getAsInt() == 101333, "exact XP");
             SnapshotTransport.Snapshot empty = new SnapshotTransport.Snapshot("Test Iron", skills, List.of(), JsonNull.INSTANCE);
-            check(status(transport.newCall(origin.resolve("/api/sync/snapshot"), token, empty)) == 200, "upload empty bank");
+            check(transport.newHostedCall(hosted, snapshotEndpoint, token, empty).execute() == 200, "upload empty bank");
             check(payload.get().has("bank") && payload.get().getAsJsonArray("bank").size() == 0, "observed empty bank is explicit");
             check(payload.get().has("slayer") && payload.get().get("slayer").isJsonNull(), "confirmed no-task state is explicit");
             SnapshotTransport.Snapshot assignment = new SnapshotTransport.Snapshot("Test Iron", skills, null, task);
-            check(status(transport.newCall(origin.resolve("/api/sync/snapshot"), token, assignment)) == 200, "upload Slayer update");
+            check(transport.newHostedCall(hosted, snapshotEndpoint, token, assignment).execute() == 200, "upload Slayer update");
             check(payload.get().get("slayer").equals(task), "include Slayer task with both nullable fields");
             check(!payload.get().has("bank"), "Slayer update does not claim to observe the bank");
-            check(status(transport.newCall(origin.resolve("/redirect"), token, empty)) == 307, "never follow redirects");
-            Call slowCall = transport.newCall(origin.resolve("/slow-response"), token, empty);
-            int slowStatus = testSender.submit(() -> status(slowCall)).get(4, TimeUnit.SECONDS);
+            check(transport.newHostedCall(hosted, origin.resolve("/redirect"), token, empty).execute() == 307, "never follow redirects");
+            SnapshotTransport.HostedUpload slowCall = transport.newHostedCall(hosted, origin.resolve("/slow-response"), token, empty);
+            int slowStatus = testSender.submit(slowCall::execute).get(4, TimeUnit.SECONDS);
             check(slowStatus == 202, "finish an upload once the response status is received");
             releaseResponse.countDown();
-            Call pendingCall = transport.newCall(origin.resolve("/pending-response"), token, empty);
+            SnapshotTransport.HostedUpload pendingCall =
+                transport.newHostedCall(hosted, origin.resolve("/pending-response"), token, empty);
             var pending = testSender.submit(() ->
             {
                 try
                 {
-                    status(pendingCall);
+                    pendingCall.execute();
                     return false;
                 }
                 catch (IOException ex)
                 {
-                    return pendingCall.isCanceled();
+                    return true;
                 }
             });
             check(waitingForHeaders.await(4, TimeUnit.SECONDS), "reach a request with pending response headers");
             pendingCall.cancel();
-            check(pending.get(4, TimeUnit.SECONDS), "cancel an in-flight upload");
+            check(pending.get(2, TimeUnit.SECONDS), "cancel an in-flight upload before its request timeout");
             System.out.println("Rune Ledger transport checks passed.");
         }
         finally
@@ -158,6 +191,112 @@ public final class SnapshotTransportTest
             releasePendingResponse.countDown();
             testSender.shutdownNow();
             server.stop(0);
+        }
+    }
+
+    private static void rejectsCertificate(SnapshotTransport.HostedUpload upload) throws IOException
+    {
+        try
+        {
+            upload.execute();
+            throw new AssertionError("reject an invalid hosted TLS certificate");
+        }
+        catch (IOException exception)
+        {
+            for (Throwable cause = exception; cause != null; cause = cause.getCause())
+            {
+                if (cause instanceof SSLHandshakeException)
+                {
+                    return;
+                }
+            }
+            throw new AssertionError("reject a certificate before sending HTTP", exception);
+        }
+    }
+
+    private static SSLContext[] testTlsContexts() throws Exception
+    {
+        Path directory = Files.createTempDirectory("rune-ledger-test-tls-");
+        Path keyFile = directory.resolve("test-key.p12");
+        String password = "synthetic-test-password";
+        try
+        {
+            Path keytool = Path.of(System.getProperty("java.home"), "bin", Platform.isWindows() ? "keytool.exe" : "keytool");
+            Process process = new ProcessBuilder(keytool.toString(), "-genkeypair", "-alias", "synthetic",
+                "-keyalg", "RSA", "-keysize", "2048", "-validity", "1", "-dname", "CN=127.0.0.1",
+                "-ext", "SAN=ip:127.0.0.1", "-storetype", "PKCS12", "-keystore", keyFile.toString(),
+                "-storepass", password, "-keypass", password, "-noprompt").redirectErrorStream(true).start();
+            if (!process.waitFor(20, TimeUnit.SECONDS))
+            {
+                process.destroyForcibly();
+                throw new AssertionError("temporary HTTPS certificate generation timed out");
+            }
+            check(process.exitValue() == 0, "generate a temporary HTTPS certificate");
+            KeyStore keys = KeyStore.getInstance("PKCS12");
+            try (InputStream input = Files.newInputStream(keyFile))
+            {
+                keys.load(input, password.toCharArray());
+            }
+            KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+            keyManagers.init(keys, password.toCharArray());
+            SSLContext server = SSLContext.getInstance("TLS");
+            server.init(keyManagers.getKeyManagers(), null, null);
+            KeyStore trust = KeyStore.getInstance(KeyStore.getDefaultType());
+            trust.load(null, null);
+            trust.setCertificateEntry("synthetic", keys.getCertificate("synthetic"));
+            TrustManagerFactory trustManagers = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            trustManagers.init(trust);
+            SSLContext client = SSLContext.getInstance("TLS");
+            client.init(null, trustManagers.getTrustManagers(), null);
+            return new SSLContext[]{server, client};
+        }
+        finally
+        {
+            Files.deleteIfExists(keyFile);
+            Files.delete(directory);
+        }
+    }
+
+    private static void checkWindowsCredentialStore(String token) throws IOException
+    {
+        if (!Platform.isWindows())
+        {
+            check(!WindowsCredentialStore.forCurrentUser().available(), "Windows persistence only applies to Windows");
+            return;
+        }
+        Path directory = Files.createTempDirectory("rune-ledger-test-credentials-");
+        WindowsCredentialStore store = new WindowsCredentialStore(directory.toRealPath());
+        CredentialScope local = new CredentialScope("Test Iron", null);
+        CredentialScope hosted = new CredentialScope("Test Iron", SnapshotTransport.endpoint("https://example.org"));
+        CredentialScope other = new CredentialScope("Test Main", null);
+        try
+        {
+            check(store.load(local) == null, "new scopes have no stored code");
+            store.save(local, token);
+            store.save(hosted, "d".repeat(64));
+            check(token.equals(store.load(new CredentialScope("TEST IRON", null))), "read a saved Windows code with the same scope");
+            check(!token.equals(store.load(hosted)) && store.load(other) == null, "separate Windows credentials by host and player");
+            try (var files = Files.list(directory.resolve("Rune Ledger Sync Plugin")))
+            {
+                for (Path file : (Iterable<Path>) files::iterator)
+                {
+                    byte[] contents = Files.readAllBytes(file);
+                    check(!Arrays.equals(contents, token.getBytes(StandardCharsets.US_ASCII))
+                        && !new String(contents, StandardCharsets.ISO_8859_1).contains(token), "store encrypted data only");
+                }
+            }
+            String replacement = "b".repeat(64);
+            store.save(local, replacement);
+            check(replacement.equals(store.load(local)), "replace an encrypted credential");
+            store.clear(local);
+            check(store.load(local) == null, "clear saved credentials");
+        }
+        finally
+        {
+            store.clear(local);
+            store.clear(hosted);
+            Files.deleteIfExists(directory.resolve("Rune Ledger Sync Plugin"));
+            Files.delete(directory);
         }
     }
 

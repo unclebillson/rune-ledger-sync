@@ -5,18 +5,23 @@ import com.google.gson.JsonElement;
 import com.google.inject.Provides;
 import java.io.IOException;
 import java.net.URI;
+import java.net.http.HttpClient;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import javax.inject.Inject;
+import javax.swing.SwingUtilities;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.Item;
@@ -29,13 +34,16 @@ import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.ProfileChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
 import okhttp3.Call;
-import okhttp3.OkHttpClient;
 import okhttp3.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,6 +59,7 @@ public class RuneLedgerPlugin extends Plugin
     private static final long UPLOAD_INTERVAL = TimeUnit.SECONDS.toNanos(15);
     private static final long RETRY_INTERVAL = TimeUnit.SECONDS.toNanos(60);
     private static final long LOCAL_DISCOVERY_INTERVAL = TimeUnit.SECONDS.toNanos(5);
+    private static final Pattern PLAYER_NAME = Pattern.compile("[A-Za-z0-9 -]{1,12}");
     private static final EnumSet<WorldType> SEPARATE_PROFILES = EnumSet.of(
         WorldType.SEASONAL, WorldType.DEADMAN, WorldType.TOURNAMENT_WORLD, WorldType.BETA_WORLD,
         WorldType.NOSAVE_MODE, WorldType.QUEST_SPEEDRUNNING, WorldType.FRESH_START_WORLD, WorldType.PVP_ARENA
@@ -63,13 +72,22 @@ public class RuneLedgerPlugin extends Plugin
     private RuneLedgerConfig config;
 
     @Inject
-    private OkHttpClient httpClient;
+    private ConfigManager configManager;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private ClientToolbar clientToolbar;
 
     @Inject
     private Gson gson;
 
     private volatile UploadWorker sender;
     private volatile Session session;
+    private volatile CredentialScope shownScope;
+    private CredentialPanel credentialPanel;
+    private NavigationButton credentialNavigation;
 
     @Provides
     RuneLedgerConfig provideConfig(ConfigManager manager)
@@ -80,7 +98,12 @@ public class RuneLedgerPlugin extends Plugin
     @Override
     protected void startUp()
     {
-        sender = new UploadWorker(new SnapshotTransport(httpClient, gson), SnapshotTransport.forLocalApp(gson));
+        clearLegacySettings();
+        credentialPanel = new CredentialPanel(this::useCode, () -> setCode(null));
+        sender = new UploadWorker(SnapshotTransport.forLocalApp(gson), SnapshotTransport.hostedClient());
+        credentialNavigation = NavigationButton.builder().tooltip("Rune Ledger Sync").priority(8)
+            .icon(CredentialPanel.icon()).panel(credentialPanel).build();
+        clientToolbar.addNavigation(credentialNavigation);
     }
 
     @Override
@@ -89,10 +112,15 @@ public class RuneLedgerPlugin extends Plugin
         UploadWorker worker = sender;
         sender = null;
         session = null;
+        shownScope = null;
+        if (credentialNavigation != null)
+        {
+            clientToolbar.removeNavigation(credentialNavigation);
+        }
         if (worker != null)
         {
             worker.cancelActiveCall();
-            worker.executor.shutdownNow();
+            worker.executor.shutdown();
         }
     }
 
@@ -106,13 +134,31 @@ public class RuneLedgerPlugin extends Plugin
         }
     }
 
+    private void clearLegacySettings()
+    {
+        configManager.unsetConfiguration(RuneLedgerConfig.GROUP, "token");
+        configManager.unsetConfiguration(RuneLedgerConfig.GROUP, "localSyncCode");
+    }
+
     @Subscribe
     public void onConfigChanged(ConfigChanged event)
     {
         if (RuneLedgerConfig.GROUP.equals(event.getGroup()))
         {
+            if (event.getProfile() == null && event.getNewValue() != null
+                && ("token".equals(event.getKey()) || "localSyncCode".equals(event.getKey())))
+            {
+                configManager.unsetConfiguration(RuneLedgerConfig.GROUP, event.getKey());
+            }
             resetSession();
         }
+    }
+
+    @Subscribe
+    public void onProfileChanged(ProfileChanged ignored)
+    {
+        clearLegacySettings();
+        resetSession();
     }
 
     @Subscribe
@@ -124,6 +170,7 @@ public class RuneLedgerPlugin extends Plugin
             case LOGGING_IN:
             case HOPPING:
             case CONNECTION_LOST:
+                showScope(null);
                 resetSession();
                 break;
             default:
@@ -135,26 +182,27 @@ public class RuneLedgerPlugin extends Plugin
     public void onGameTick(GameTick ignored)
     {
         UploadWorker worker = sender;
-        if (worker == null || !config.syncEnabled() || client.getGameState() != GameState.LOGGED_IN
-            || client.getLocalPlayer() == null || !java.util.Collections.disjoint(client.getWorldType(), SEPARATE_PROFILES))
+        if (worker == null)
+        {
+            return;
+        }
+        CredentialScope scope = activeScope();
+        showScope(scope);
+        if (scope == null || !config.syncEnabled())
         {
             resetSession();
             return;
         }
 
-        String name = SnapshotTransport.normalizeName(client.getLocalPlayer().getName());
-        boolean localApp = config.localApp();
-        String configuredToken = localApp ? config.localSyncCode() : config.token();
-        String token = configuredToken == null ? "" : configuredToken.trim();
-        if (name.isEmpty() || !SnapshotTransport.validToken(token)
-            || (!localApp && !name.equalsIgnoreCase(SnapshotTransport.normalizeName(config.playerName()))))
+        String token = worker.credential(scope);
+        if (token == null)
         {
             resetSession();
             return;
         }
+        boolean localApp = scope.hostedEndpoint == null;
         LocalAppTarget localTarget = localApp ? worker.discoverLocalApp() : null;
-        URI endpoint = localApp ? (localTarget == null ? null : localTarget.endpoint) : SnapshotTransport.endpoint(config.serverUrl());
-        if (endpoint == null)
+        if (localApp && localTarget == null)
         {
             resetSession();
             return;
@@ -162,10 +210,10 @@ public class RuneLedgerPlugin extends Plugin
         boolean bankEnabled = config.syncBank();
         boolean slayerEnabled = config.syncSlayer();
         Session active = session;
-        if (active == null || !active.matches(name, endpoint, localTarget, token, bankEnabled, slayerEnabled))
+        if (active == null || !active.matches(scope, localTarget, token, bankEnabled, slayerEnabled))
         {
             resetSession();
-            active = new Session(name, endpoint, localTarget, token, bankEnabled, slayerEnabled);
+            active = new Session(scope, localTarget, token, bankEnabled, slayerEnabled);
             session = active;
         }
         if (bankEnabled)
@@ -179,6 +227,87 @@ public class RuneLedgerPlugin extends Plugin
             return;
         }
         sampleAndSend(worker, active);
+    }
+
+    private CredentialScope activeScope()
+    {
+        if (client.getGameState() != GameState.LOGGED_IN || client.getLocalPlayer() == null
+            || !java.util.Collections.disjoint(client.getWorldType(), SEPARATE_PROFILES))
+        {
+            return null;
+        }
+        String name = SnapshotTransport.normalizeName(client.getLocalPlayer().getName());
+        if (!PLAYER_NAME.matcher(name).matches())
+        {
+            return null;
+        }
+        if (config.localApp())
+        {
+            return new CredentialScope(name, null);
+        }
+        URI endpoint = SnapshotTransport.endpoint(config.serverUrl());
+        if (endpoint != null && name.equalsIgnoreCase(SnapshotTransport.normalizeName(config.playerName())))
+        {
+            return new CredentialScope(name, endpoint);
+        }
+        return null;
+    }
+
+    private void showScope(CredentialScope scope)
+    {
+        if (Objects.equals(shownScope, scope))
+        {
+            return;
+        }
+        shownScope = scope;
+        CredentialPanel panel = credentialPanel;
+        SwingUtilities.invokeLater(() -> panel.showScope(scope));
+    }
+
+    private void useCode(char[] password)
+    {
+        String code = new String(password).trim();
+        Arrays.fill(password, '\0');
+        if (!SnapshotTransport.validToken(code))
+        {
+            credentialPanel.finish("Paste a valid Rune Ledger sync code.");
+            return;
+        }
+        setCode(code);
+    }
+
+    private void setCode(String code)
+    {
+        UploadWorker worker = sender;
+        CredentialPanel panel = credentialPanel;
+        CredentialScope selected = panel.selectedScope();
+        clientThread.invokeLater(() ->
+        {
+            if (worker == null || sender != worker)
+            {
+                return;
+            }
+            CredentialScope scope = activeScope();
+            if (scope == null || !scope.equals(selected))
+            {
+                SwingUtilities.invokeLater(() -> panel.finish("Check the logged-in character and the selected Rune Ledger destination."));
+                return;
+            }
+            worker.credentials.put(scope, new CredentialEntry(code));
+            resetSession();
+            try
+            {
+                worker.executor.execute(() ->
+                {
+                    String message = worker.persistCredential(scope, code);
+                    SwingUtilities.invokeLater(() -> panel.finish(message));
+                });
+            }
+            catch (RejectedExecutionException ignored)
+            {
+                SwingUtilities.invokeLater(() -> panel.finish("Rune Ledger Sync is closing."));
+            }
+        });
     }
 
     @Subscribe
@@ -286,7 +415,7 @@ public class RuneLedgerPlugin extends Plugin
         {
             return;
         }
-        SnapshotTransport.Snapshot snapshot = new SnapshotTransport.Snapshot(active.player, skills, bankStacks, slayer);
+        SnapshotTransport.Snapshot snapshot = new SnapshotTransport.Snapshot(active.scope.player, skills, bankStacks, slayer);
         try
         {
             worker.executor.execute(() -> upload(worker, active, snapshot, fingerprint, bank));
@@ -305,10 +434,17 @@ public class RuneLedgerPlugin extends Plugin
             {
                 return;
             }
-            Call call;
+            int status;
             if (active.localTarget == null)
             {
-                call = worker.transport.newCall(active.endpoint, active.token, snapshot);
+                SnapshotTransport.HostedUpload call = worker.transport.newHostedCall(worker.hostedClient,
+                    active.scope.hostedEndpoint, active.token, snapshot);
+                worker.cancelActive = call::cancel;
+                if (sender != worker || session != active)
+                {
+                    return;
+                }
+                status = call.execute();
             }
             else
             {
@@ -317,18 +453,16 @@ public class RuneLedgerPlugin extends Plugin
                 {
                     return;
                 }
-                call = worker.localTransport.newLocalCall(probe, active.token, snapshot);
-            }
-            worker.activeCall = call;
-            if (sender != worker || session != active)
-            {
-                return;
-            }
-            int status;
-            // This runs on the upload worker, off the RuneLite client thread.
-            try (Response response = call.execute())
-            {
-                status = response.code();
+                Call call = worker.transport.newLocalCall(probe, active.token, snapshot);
+                worker.cancelActive = call::cancel;
+                if (sender != worker || session != active)
+                {
+                    return;
+                }
+                try (Response response = call.execute())
+                {
+                    status = response.code();
+                }
             }
             if (sender != worker || session != active)
             {
@@ -365,15 +499,15 @@ public class RuneLedgerPlugin extends Plugin
         }
         finally
         {
-            worker.activeCall = null;
+            worker.cancelActive = null;
             worker.sending.set(false);
         }
     }
 
     private boolean verifyLocalApp(UploadWorker worker, Session active, SnapshotTransport.LocalProbe probe) throws IOException
     {
-        Call call = worker.localTransport.probeLocalApp(probe);
-        worker.activeCall = call;
+        Call call = worker.transport.probeLocalApp(probe);
+        worker.cancelActive = call::cancel;
         if (sender != worker || session != active)
         {
             return false;
@@ -393,9 +527,11 @@ public class RuneLedgerPlugin extends Plugin
     private static final class UploadWorker
     {
         final SnapshotTransport transport;
-        final SnapshotTransport localTransport;
+        final HttpClient hostedClient;
+        final Map<CredentialScope, CredentialEntry> credentials = new ConcurrentHashMap<>();
+        private final WindowsCredentialStore credentialStore = WindowsCredentialStore.forCurrentUser();
         final AtomicBoolean sending = new AtomicBoolean();
-        volatile Call activeCall;
+        volatile Runnable cancelActive;
         private volatile LocalAppTarget localTarget;
         private long nextDiscovery;
         final ExecutorService executor = Executors.newSingleThreadExecutor(task ->
@@ -405,10 +541,71 @@ public class RuneLedgerPlugin extends Plugin
             return thread;
         });
 
-        UploadWorker(SnapshotTransport transport, SnapshotTransport localTransport)
+        UploadWorker(SnapshotTransport transport, HttpClient hostedClient)
         {
             this.transport = transport;
-            this.localTransport = localTransport;
+            this.hostedClient = hostedClient;
+        }
+
+        String credential(CredentialScope scope)
+        {
+            CredentialEntry entry = credentials.get(scope);
+            if (entry != null)
+            {
+                return entry.code;
+            }
+            if (credentialStore.available())
+            {
+                CredentialEntry pending = new CredentialEntry(null);
+                if (credentials.putIfAbsent(scope, pending) == null)
+                {
+                    try
+                    {
+                        executor.execute(() -> loadCredential(scope, pending));
+                    }
+                    catch (RejectedExecutionException ignored)
+                    {
+                        // The plugin is stopping.
+                    }
+                }
+            }
+            return null;
+        }
+
+        private void loadCredential(CredentialScope scope, CredentialEntry pending)
+        {
+            try
+            {
+                credentials.replace(scope, pending, new CredentialEntry(credentialStore.load(scope)));
+            }
+            catch (IOException | RuntimeException | LinkageError ignored)
+            {
+                LOG.warn("Rune Ledger could not load a Windows-protected sync code. Enter a new code in the sidebar.");
+            }
+        }
+
+        String persistCredential(CredentialScope scope, String code)
+        {
+            try
+            {
+                if (code == null)
+                {
+                    credentialStore.clear(scope);
+                    return "Code cleared.";
+                }
+                if (credentialStore.available())
+                {
+                    credentialStore.save(scope, code);
+                    return "Code saved on this PC.";
+                }
+            }
+            catch (IOException | RuntimeException | LinkageError ignored)
+            {
+                return code == null
+                    ? "Code cleared for this session. Windows could not remove the saved code."
+                    : "Windows could not save this code. It will be used for this RuneLite session.";
+            }
+            return "Code ready for this RuneLite session.";
         }
 
         LocalAppTarget discoverLocalApp()
@@ -441,18 +638,27 @@ public class RuneLedgerPlugin extends Plugin
 
         void cancelActiveCall()
         {
-            Call call = activeCall;
-            if (call != null)
+            Runnable cancel = cancelActive;
+            if (cancel != null)
             {
-                call.cancel();
+                cancel.run();
             }
+        }
+    }
+
+    private static final class CredentialEntry
+    {
+        final String code;
+
+        CredentialEntry(String code)
+        {
+            this.code = code;
         }
     }
 
     private static final class Session
     {
-        final String player;
-        final URI endpoint;
+        final CredentialScope scope;
         final LocalAppTarget localTarget;
         final String token;
         final boolean bankEnabled;
@@ -465,19 +671,18 @@ public class RuneLedgerPlugin extends Plugin
         volatile JsonElement uploadedSlayer;
         volatile long nextUpload;
 
-        Session(String player, URI endpoint, LocalAppTarget localTarget, String token, boolean bankEnabled, boolean slayerEnabled)
+        Session(CredentialScope scope, LocalAppTarget localTarget, String token, boolean bankEnabled, boolean slayerEnabled)
         {
-            this.player = player;
-            this.endpoint = endpoint;
+            this.scope = scope;
             this.localTarget = localTarget;
             this.token = token;
             this.bankEnabled = bankEnabled;
             this.slayerEnabled = slayerEnabled;
         }
 
-        boolean matches(String name, URI target, LocalAppTarget local, String credential, boolean includeBank, boolean includeSlayer)
+        boolean matches(CredentialScope selected, LocalAppTarget local, String credential, boolean includeBank, boolean includeSlayer)
         {
-            return player.equalsIgnoreCase(name) && endpoint.equals(target) && token.equals(credential)
+            return scope.equals(selected) && token.equals(credential)
                 && Objects.equals(localTarget, local) && bankEnabled == includeBank && slayerEnabled == includeSlayer;
         }
     }

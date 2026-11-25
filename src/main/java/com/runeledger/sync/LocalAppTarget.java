@@ -35,7 +35,7 @@ final class LocalAppTarget
 
     private LocalAppTarget(int port, String proofKey)
     {
-        this.endpoint = SnapshotTransport.endpoint("http://127.0.0.1:" + port);
+        this.endpoint = URI.create("http://127.0.0.1:" + port + "/api/sync/snapshot");
         this.proofKey = proofKey;
     }
 

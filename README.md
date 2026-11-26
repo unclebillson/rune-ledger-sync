@@ -43,11 +43,11 @@ gradle -PruneLiteVersion=1.13.8 build
 gradle -PruneLiteVersion=1.13.8 run
 ```
 
-`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.1-beta.3.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
+`build` runs the transport test and creates `build/libs/runelite-rune-ledger-0.1.1-beta.4.jar`. The `run` task starts a RuneLite developer client and registers Rune Ledger Sync. Find it in the plugin list and follow the pairing steps above. Plugin Hub distribution depends on RuneLite review.
 
 Hosted uploads use JDK HTTPS with certificate and hostname verification. The numeric loopback connection uses RuneLite's HTTP library with the desktop HMAC check. RuneLite still supplies its own runtime libraries, so updates to those libraries follow the client release.
 
-For an offline build using JARs from a previously run RuneLite version, pass the launcher’s local dependency cache. The runtime API in that cache omits the named game constants. Download the full [RuneLite 1.13.8 compile-time API](https://repo.runelite.net/net/runelite/runelite-api/1.13.8/runelite-api-1.13.8.jar) once and place it at `.gradle/runeledger-api/runelite-api-1.13.8.jar` inside this plugin directory. Then run:
+For an offline build using JARs from a previously run RuneLite version, pass the launcher’s local dependency cache. Download the full [RuneLite 1.13.8 API](https://repo.runelite.net/net/runelite/runelite-api/1.13.8/runelite-api-1.13.8.jar) once and place it at `.gradle/runeledger-api/runelite-api-1.13.8.jar` inside this plugin directory. The offline build and developer launcher both use it for the named game constants. Then run:
 
 ```powershell
 gradle --offline "-PruneLiteCache=$env:USERPROFILE/.runelite/repository2" -PruneLiteVersion=1.13.8 build

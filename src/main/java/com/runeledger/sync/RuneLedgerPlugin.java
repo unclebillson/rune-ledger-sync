@@ -4,7 +4,6 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.inject.Provides;
 import java.io.IOException;
-import java.net.URI;
 import java.net.http.HttpClient;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -19,14 +18,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
-import net.runelite.api.Skill;
+import net.runelite.api.Player;
 import net.runelite.api.WorldType;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
@@ -60,7 +58,6 @@ public class RuneLedgerPlugin extends Plugin
     private static final long RETRY_INTERVAL = TimeUnit.SECONDS.toNanos(60);
     private static final long QUEST_SCAN_INTERVAL = TimeUnit.MINUTES.toNanos(1);
     private static final long LOCAL_DISCOVERY_INTERVAL = TimeUnit.SECONDS.toNanos(5);
-    private static final Pattern PLAYER_NAME = Pattern.compile("[A-Za-z0-9 -]{1,12}");
     private static final EnumSet<WorldType> SEPARATE_PROFILES = EnumSet.of(
         WorldType.SEASONAL, WorldType.DEADMAN, WorldType.TOURNAMENT_WORLD, WorldType.BETA_WORLD,
         WorldType.NOSAVE_MODE, WorldType.QUEST_SPEEDRUNNING, WorldType.FRESH_START_WORLD, WorldType.PVP_ARENA
@@ -87,6 +84,7 @@ public class RuneLedgerPlugin extends Plugin
     private volatile UploadWorker sender;
     private volatile Session session;
     private volatile CredentialScope shownScope;
+    private final CredentialScope.Resolver scopeResolver = new CredentialScope.Resolver();
     private CredentialPanel credentialPanel;
     private NavigationButton credentialNavigation;
 
@@ -101,7 +99,7 @@ public class RuneLedgerPlugin extends Plugin
     {
         clearLegacySettings();
         credentialPanel = new CredentialPanel(this::useCode, () -> setCode(null));
-        sender = new UploadWorker(SnapshotTransport.forLocalApp(gson), SnapshotTransport.hostedClient());
+        sender = new UploadWorker(gson);
         credentialNavigation = NavigationButton.builder().tooltip("Rune Ledger Sync").priority(8)
             .icon(CredentialPanel.icon()).panel(credentialPanel).build();
         clientToolbar.addNavigation(credentialNavigation);
@@ -237,26 +235,20 @@ public class RuneLedgerPlugin extends Plugin
 
     private CredentialScope activeScope()
     {
-        if (client.getGameState() != GameState.LOGGED_IN || client.getLocalPlayer() == null
-            || !java.util.Collections.disjoint(client.getWorldType(), SEPARATE_PROFILES))
+        if (client.getGameState() != GameState.LOGGED_IN)
         {
             return null;
         }
-        String name = SnapshotTransport.normalizeName(client.getLocalPlayer().getName());
-        if (!PLAYER_NAME.matcher(name).matches())
+        Player player = client.getLocalPlayer();
+        if (player == null || !java.util.Collections.disjoint(client.getWorldType(), SEPARATE_PROFILES))
         {
             return null;
         }
         if (config.localApp())
         {
-            return new CredentialScope(name, null);
+            return scopeResolver.resolve(player.getName(), true, null, null);
         }
-        URI endpoint = SnapshotTransport.endpoint(config.serverUrl());
-        if (endpoint != null && name.equalsIgnoreCase(SnapshotTransport.normalizeName(config.playerName())))
-        {
-            return new CredentialScope(name, endpoint);
-        }
-        return null;
+        return scopeResolver.resolve(player.getName(), false, config.serverUrl(), config.playerName());
     }
 
     private void showScope(CredentialScope scope)
@@ -386,46 +378,26 @@ public class RuneLedgerPlugin extends Plugin
             return;
         }
 
-        List<SnapshotTransport.SkillValue> skills = new ArrayList<>();
-        for (Skill skill : Skill.values())
-        {
-            int level = client.getRealSkillLevel(skill);
-            int xp = client.getSkillExperience(skill);
-            if (level > 0 && xp >= 0)
-            {
-                skills.add(new SnapshotTransport.SkillValue(skill.getName(), level, xp));
-            }
-        }
-        if (skills.isEmpty())
+        if (!active.skills.capture(client))
         {
             return;
         }
-        String fingerprint = worker.transport.fingerprint(skills);
         Map<Integer, Integer> bank = Objects.equals(active.observedBank, active.uploadedBank) ? null : active.observedBank;
         JsonElement slayer = sampleSlayer(active);
         JsonElement quests = Objects.equals(active.observedQuests, active.uploadedQuests) ? null : active.observedQuests;
-        if (fingerprint.equals(active.uploadedSkills) && bank == null && slayer == null && quests == null)
+        if (active.skills.unchangedSince(active.uploadedSkills) && bank == null && slayer == null && quests == null)
         {
             active.nextUpload = now + UPLOAD_INTERVAL;
             return;
-        }
-        List<SnapshotTransport.BankStack> bankStacks = null;
-        if (bank != null)
-        {
-            bankStacks = new ArrayList<>();
-            for (Map.Entry<Integer, Integer> entry : bank.entrySet())
-            {
-                bankStacks.add(new SnapshotTransport.BankStack(entry.getKey(), entry.getValue()));
-            }
         }
         if (!worker.sending.compareAndSet(false, true))
         {
             return;
         }
-        SnapshotTransport.Snapshot snapshot = new SnapshotTransport.Snapshot(active.scope.player, skills, bankStacks, slayer, quests);
+        int[] sampledSkills = active.skills.copy();
         try
         {
-            worker.executor.execute(() -> upload(worker, active, snapshot, fingerprint, bank));
+            worker.executor.execute(() -> upload(worker, active, sampledSkills, bank, slayer, quests));
         }
         catch (RejectedExecutionException ignored)
         {
@@ -462,7 +434,8 @@ public class RuneLedgerPlugin extends Plugin
         active.nextQuestScan = now + QUEST_SCAN_INTERVAL;
     }
 
-    private void upload(UploadWorker worker, Session active, SnapshotTransport.Snapshot snapshot, String fingerprint, Map<Integer, Integer> bank)
+    private void upload(UploadWorker worker, Session active, int[] skills, Map<Integer, Integer> bank, JsonElement slayer,
+        JsonElement quests)
     {
         try
         {
@@ -470,10 +443,22 @@ public class RuneLedgerPlugin extends Plugin
             {
                 return;
             }
+            SnapshotTransport transport = worker.transport();
+            List<SnapshotTransport.BankStack> bankStacks = null;
+            if (bank != null)
+            {
+                bankStacks = new ArrayList<>(bank.size());
+                for (Map.Entry<Integer, Integer> entry : bank.entrySet())
+                {
+                    bankStacks.add(new SnapshotTransport.BankStack(entry.getKey(), entry.getValue()));
+                }
+            }
+            SnapshotTransport.Snapshot snapshot = new SnapshotTransport.Snapshot(active.scope.player,
+                SkillSamples.entries(skills), bankStacks, slayer, quests);
             int status;
             if (active.localTarget == null)
             {
-                SnapshotTransport.HostedUpload call = worker.transport.newHostedCall(worker.hostedClient,
+                SnapshotTransport.HostedUpload call = transport.newHostedCall(worker.hostedClient(),
                     active.scope.hostedEndpoint, active.token, snapshot);
                 worker.cancelActive = call::cancel;
                 if (sender != worker || session != active)
@@ -485,11 +470,11 @@ public class RuneLedgerPlugin extends Plugin
             else
             {
                 SnapshotTransport.LocalProbe probe = new SnapshotTransport.LocalProbe(active.localTarget);
-                if (!verifyLocalApp(worker, active, probe))
+                if (!verifyLocalApp(worker, active, transport, probe))
                 {
                     return;
                 }
-                Call call = worker.transport.newLocalCall(probe, active.token, snapshot);
+                Call call = transport.newLocalCall(probe, active.token, snapshot);
                 worker.cancelActive = call::cancel;
                 if (sender != worker || session != active)
                 {
@@ -506,7 +491,7 @@ public class RuneLedgerPlugin extends Plugin
             }
             if (status >= 200 && status < 300)
             {
-                active.uploadedSkills = fingerprint;
+                active.uploadedSkills = skills;
                 if (bank != null)
                 {
                     active.uploadedBank = bank;
@@ -527,7 +512,7 @@ public class RuneLedgerPlugin extends Plugin
                 LOG.warn("Rune Ledger declined the snapshot (HTTP {}). Check the pairing settings.", status);
             }
         }
-        catch (IOException ex)
+        catch (IOException | IllegalStateException ex)
         {
             if (sender == worker && session == active)
             {
@@ -544,9 +529,10 @@ public class RuneLedgerPlugin extends Plugin
         }
     }
 
-    private boolean verifyLocalApp(UploadWorker worker, Session active, SnapshotTransport.LocalProbe probe) throws IOException
+    private boolean verifyLocalApp(UploadWorker worker, Session active, SnapshotTransport transport,
+        SnapshotTransport.LocalProbe probe) throws IOException
     {
-        Call call = worker.transport.probeLocalApp(probe);
+        Call call = transport.probeLocalApp(probe);
         worker.cancelActive = call::cancel;
         if (sender != worker || session != active)
         {
@@ -566,8 +552,9 @@ public class RuneLedgerPlugin extends Plugin
 
     private static final class UploadWorker
     {
-        final SnapshotTransport transport;
-        final HttpClient hostedClient;
+        private final Gson gson;
+        private SnapshotTransport transport;
+        private HttpClient hostedClient;
         final Map<CredentialScope, CredentialEntry> credentials = new ConcurrentHashMap<>();
         private final WindowsCredentialStore credentialStore = WindowsCredentialStore.forCurrentUser();
         final AtomicBoolean sending = new AtomicBoolean();
@@ -581,10 +568,27 @@ public class RuneLedgerPlugin extends Plugin
             return thread;
         });
 
-        UploadWorker(SnapshotTransport transport, HttpClient hostedClient)
+        UploadWorker(Gson gson)
         {
-            this.transport = transport;
-            this.hostedClient = hostedClient;
+            this.gson = gson;
+        }
+
+        SnapshotTransport transport()
+        {
+            if (transport == null)
+            {
+                transport = SnapshotTransport.forLocalApp(gson);
+            }
+            return transport;
+        }
+
+        HttpClient hostedClient()
+        {
+            if (hostedClient == null)
+            {
+                hostedClient = SnapshotTransport.hostedClient();
+            }
+            return hostedClient;
         }
 
         String credential(CredentialScope scope)
@@ -708,7 +712,8 @@ public class RuneLedgerPlugin extends Plugin
         boolean bankNeedsCapture = true;
         Map<Integer, Integer> observedBank;
         volatile Map<Integer, Integer> uploadedBank;
-        volatile String uploadedSkills;
+        final SkillSamples skills = new SkillSamples();
+        volatile int[] uploadedSkills;
         volatile JsonElement uploadedSlayer;
         QuestProgressReader questReader;
         JsonElement observedQuests;

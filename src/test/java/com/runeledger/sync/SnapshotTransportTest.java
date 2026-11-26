@@ -41,6 +41,7 @@ import javax.net.ssl.TrustManagerFactory;
 import net.runelite.api.Client;
 import net.runelite.api.Quest;
 import net.runelite.api.QuestState;
+import net.runelite.api.Skill;
 import okhttp3.Call;
 import okhttp3.Response;
 
@@ -61,6 +62,8 @@ public final class SnapshotTransportTest
             "normalize hosted destinations before choosing a code");
         check(SnapshotTransport.normalizeName(" Test_Iron ").equals("Test Iron"), "normalize display name");
         check(SnapshotTransport.normalizeName(" Test_\u00a0 Iron ").equals("Test Iron"), "collapse multiple display-name separators");
+        checkScopeCache();
+        checkSkillSamples();
         check(!SnapshotTransport.validToken("short"), "reject weak token");
         check(!SnapshotTransport.validToken(null), "reject an unset token");
         String token = "a".repeat(64);
@@ -306,6 +309,54 @@ public final class SnapshotTransportTest
             Files.deleteIfExists(directory.resolve("Rune Ledger Sync Plugin"));
             Files.delete(directory);
         }
+    }
+
+    private static void checkScopeCache()
+    {
+        CredentialScope.Resolver resolver = new CredentialScope.Resolver();
+        String hostedUrl = "https://EXAMPLE.ORG:443/";
+        CredentialScope hosted = resolver.resolve("Test_Iron", false, hostedUrl, "Test Iron");
+        check(hosted != null && hosted.hostedEndpoint.equals(SnapshotTransport.endpoint(hostedUrl)), "accept configured hosted scope");
+        check(resolver.resolve("Test_Iron", false, hostedUrl, "Test Iron") == hosted, "reuse the scope on an unchanged tick");
+        check(resolver.resolve("Test_Iron", false, "http://example.org", "Test Iron") == null, "revalidate changed destinations");
+        check(resolver.resolve("Test_Iron", false, hostedUrl, "Other Player") == null, "revalidate the configured character");
+        check(resolver.resolve("Other Player", false, hostedUrl, "Test Iron") == null, "revalidate the active character");
+        CredentialScope local = resolver.resolve("Test_Iron", true, null, null);
+        check(local != null && local.hostedEndpoint == null && !local.equals(hosted), "keep local and hosted scopes separate");
+        CredentialScope mixedCase = new CredentialScope("test iron", null);
+        check(local.equals(mixedCase) && local.hashCode() == mixedCase.hashCode(), "preserve case-insensitive credential lookup");
+        check(resolver.resolve("Invalid!", true, null, null) == null, "recheck invalid local names");
+    }
+
+    private static void checkSkillSamples()
+    {
+        int[] levels = new int[Skill.values().length];
+        int[] xp = new int[levels.length];
+        int magic = Skill.MAGIC.ordinal();
+        levels[magic] = 55;
+        xp[magic] = 166_636;
+        Client client = (Client) Proxy.newProxyInstance(Client.class.getClassLoader(), new Class<?>[]{Client.class},
+            (proxy, method, args) ->
+            {
+                int index = ((Skill) args[0]).ordinal();
+                if (method.getName().equals("getRealSkillLevel"))
+                {
+                    return levels[index];
+                }
+                check(method.getName().equals("getSkillExperience"), "read only the required skill state");
+                return xp[index];
+            });
+        SkillSamples samples = new SkillSamples();
+        check(samples.capture(client), "capture a valid skill");
+        int[] first = samples.copy();
+        check(samples.unchangedSince(first), "recognize unchanged exact values");
+        xp[magic]++;
+        check(samples.capture(client) && !samples.unchangedSince(first), "notice XP gain within the same level");
+        List<SnapshotTransport.SkillValue> entries = SkillSamples.entries(first);
+        check(entries.size() == 1 && entries.get(0).name.equals(Skill.MAGIC.getName())
+            && entries.get(0).level == 55 && entries.get(0).xp == 166_636, "keep a queued upload unchanged after another capture");
+        xp[magic] = -1;
+        check(!samples.capture(client) && SkillSamples.entries(samples.copy()).isEmpty(), "omit unavailable skills");
     }
 
     private static void checkLocalApp(Gson gson, String token) throws IOException

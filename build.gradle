@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'com.runeledger'
-version = '0.1.1-beta.3'
+version = '0.1.1-beta.4'
 
 repositories {
     maven {
@@ -15,6 +15,7 @@ repositories {
 
 def runeLiteVersion = providers.gradleProperty('runeLiteVersion').orElse('1.13.8').get()
 def runeLiteCache = providers.gradleProperty('runeLiteCache').orNull
+def fullCachedApi
 
 dependencies {
     if (runeLiteCache == null) {
@@ -33,6 +34,7 @@ dependencies {
         if (!compileApi.isFile()) {
             throw new GradleException("The full ${apiJar} is needed for game constants. See README.md for the offline setup.")
         }
+        fullCachedApi = compileApi
         def cached = fileTree(runeLiteCache) {
             include '*.jar'
             exclude { entry ->
@@ -57,6 +59,7 @@ tasks.withType(JavaCompile).configureEach {
 tasks.register('run', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     if (runeLiteCache != null) {
+        classpath = files(fullCachedApi) + classpath
         def authHelper = layout.buildDirectory.file('dependencies/jagexauth-0.3.jar').get().asFile
         if (authHelper.isFile()) {
             classpath += files(authHelper)

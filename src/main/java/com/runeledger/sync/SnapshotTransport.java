@@ -138,11 +138,6 @@ final class SnapshotTransport
         return token != null && TOKEN.matcher(token).matches();
     }
 
-    String fingerprint(List<SkillValue> skills)
-    {
-        return gson.toJson(skills);
-    }
-
     static String normalizeName(String name)
     {
         return name == null ? "" : NAME_SPACES.matcher(name).replaceAll(" ").trim();
